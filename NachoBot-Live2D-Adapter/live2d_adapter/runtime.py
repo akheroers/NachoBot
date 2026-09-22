@@ -16,6 +16,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .config import AdapterConfig
+from .control_pipeline import ControlPipeline
 from .model_adapter import Live2DModelAdapter
 from .protocol import (
     AvatarCommand,
@@ -49,6 +50,7 @@ class AvatarRuntime:
         self._started = False
         self._renderer_ready = threading.Event()
         self._renderer_start_error: Exception | None = None
+        self.control_pipeline = ControlPipeline()
 
     @property
     def is_running(self) -> bool:
@@ -148,15 +150,24 @@ class AvatarRuntime:
                     "height": renderer_config.height,
                     "mode": self.config.runtime.mode,
                     "adaptation": adaptation_report,
+                    "protocol_version": "1.1",
+                    "capabilities": {
+                        "prepare_reply": True,
+                        "apply_control": True,
+                        "commands": ["prepare_reply", "apply_control"],
+                        "interactions": ["reply_prepared", "control_applied"],
+                    },
                 },
             )
         )
 
     async def stop(self) -> None:
         if not self._started:
+            self.control_pipeline.clear()
             return
 
         self._started = False
+        self.control_pipeline.clear()
         renderer = self.renderer
         render_thread = self.render_thread
 
@@ -174,7 +185,11 @@ class AvatarRuntime:
         self.render_thread = None
         self.logger.info("Live2D runtime stopped")
 
-    async def dispatch(self, command: AvatarCommand) -> InteractionEvent | None:
+    async def dispatch(
+        self,
+        command: AvatarCommand,
+        client_id: str = ControlPipeline.DEFAULT_CLIENT_ID,
+    ) -> InteractionEvent | None:
         event = command.event
         payload = command.payload
 
@@ -191,6 +206,36 @@ class AvatarRuntime:
 
         if not self._started:
             raise ProtocolError("Live2D runtime is not started")
+
+        if event is AvatarEvent.PREPARE_REPLY:
+            raw_reply = payload.get("reply")
+            if raw_reply is None:
+                raw_reply = payload.get("text")
+            if raw_reply is None:
+                raw_reply = payload.get("raw_reply", "")
+            prepared = self.control_pipeline.prepare_reply(
+                raw_reply,
+                command.request_id,
+                client_id=client_id,
+            )
+            return InteractionEvent(
+                event=AvatarInteraction.REPLY_PREPARED,
+                payload=prepared.to_payload(),
+                request_id=command.request_id,
+            )
+
+        if event is AvatarEvent.APPLY_CONTROL:
+            control_id = self._required_string(payload, "control_id")
+            outcome = self.control_pipeline.apply(
+                control_id,
+                client_id=client_id,
+                apply_callback=self._apply_staged_control,
+            )
+            return InteractionEvent(
+                event=AvatarInteraction.CONTROL_APPLIED,
+                payload=outcome.to_payload(),
+                request_id=command.request_id,
+            )
 
         if event is AvatarEvent.STATE:
             self._enqueue("state", self._required_string(payload, "state"))
@@ -271,6 +316,31 @@ class AvatarRuntime:
             raise ProtocolError(f"unsupported runtime event: {event.value}")
 
         return None
+
+    def discard_client_controls(self, client_id: str) -> None:
+        """Drop all staged state owned by a disconnected WebSocket client."""
+
+        self.control_pipeline.discard_client(client_id)
+
+    def _apply_staged_control(self, staged: Any) -> None:
+        """Resolve and enqueue a validated staged control atomically."""
+
+        action_id = getattr(staged, "action_id", None)
+        motion_group = None
+        if action_id:
+            motion_group = (
+                self.model_adapter.resolve_action(action_id)
+                if self.model_adapter is not None
+                else self.config.resolve_action(action_id)
+            )
+            if not motion_group:
+                raise ProtocolError(f"unmapped canonical action: {action_id}")
+
+        emotion = getattr(staged, "emotion", None)
+        if emotion:
+            self._enqueue("emotion", emotion)
+        if motion_group:
+            self._enqueue("body_action", motion_group)
 
     def _run_renderer(self) -> None:
         assert self.renderer is not None
